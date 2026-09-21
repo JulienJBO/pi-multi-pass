@@ -2,6 +2,20 @@
 
 Multi-subscription extension for [pi](https://github.com/earendil-works/pi-coding-agent) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
 
+> **About this fork** (`fix/extension-provider-oauth`): upstream 1.5.1 resolves
+> OAuth flows only from pi-ai's built-in provider catalog, so subscriptions
+> whose base provider is registered at runtime by a Pi extension (e.g. the
+> `antigravity` provider from [pi-oauth-antigravity](https://github.com/heyhuynhgiabuu/pi-oauth-antigravity))
+> fail at login with `No built-in OAuth flow available`. This branch makes the
+> resolver generic — runtime model registry first, built-in catalog fallback —
+> and registers extension-backed subscriptions on `session_start` (during the
+> load phase the registry does not see other extensions' providers yet, so
+> such subs are selectable mid-session via `/model` or `/subs switch`, but not
+> as a startup `--model`). Everything else is unchanged; the diff is kept
+> minimal and upstreamable. If upstream absorbs an equivalent fix, switch back
+> with `pi install npm:pi-multi-pass`. Base commit: `0d9a211` (1.5.1);
+> validated against pi 0.85.1.
+
 ## Install
 
 ```bash
@@ -12,6 +26,12 @@ Or via git:
 
 ```bash
 pi install git:github.com/hjanuschka/pi-multi-pass
+```
+
+This fork's branch:
+
+```bash
+pi install git:github.com/JulienJBO/pi-multi-pass@fix/extension-provider-oauth
 ```
 
 ## Features
