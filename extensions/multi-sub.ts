@@ -97,6 +97,24 @@ interface OAuthProviderInterface {
 	modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
 }
 
+/** Process-local bridge exposed by provider extensions (notably pi-oauth-antigravity). */
+interface ExternalProviderAdapter {
+	providerId: string;
+	displayName: string;
+	baseUrl?: string;
+	api?: Api;
+	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
+	getModels(providerName: string, index: number): Model<Api>[];
+}
+
+type MultiPassGlobal = typeof globalThis & {
+	__PI_MULTI_PASS_PROVIDER_ADAPTERS_V1__?: Map<string, ExternalProviderAdapter>;
+};
+
+function getExternalProviderAdapter(providerId: string): ExternalProviderAdapter | undefined {
+	return (globalThis as MultiPassGlobal).__PI_MULTI_PASS_PROVIDER_ADAPTERS_V1__?.get(providerId);
+}
+
 /** New pi-ai OAuth flow surface (`OAuthAuth`), resolved from the built-in catalog. */
 interface BuiltinOAuthFlow {
 	name: string;
@@ -306,9 +324,12 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 		displayName: "Antigravity",
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return flowBackedOAuth("google-antigravity", `Antigravity #${index}`, {
-				usesCallbackServer: true,
-			});
+			// Prefer the cache-aware external provider when installed. Keep the
+			// built-in flow as a compatibility fallback for standalone multi-pass.
+			return getExternalProviderAdapter("google-antigravity")?.buildOAuth(index)
+				?? flowBackedOAuth("google-antigravity", `Antigravity #${index}`, {
+					usesCallbackServer: true,
+				});
 		},
 	},
 
@@ -1078,18 +1099,19 @@ async function resolveGoogleQuotaAccess(
 	}
 
 	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
-		// pi-ai >= 0.84: use the built-in provider OAuth flow to refresh the
-		// access token instead of the removed refreshGoogleCloudToken helpers.
-		const flow = getBuiltinOAuthFlow(account.baseProvider);
-		const credentials = await flow.refresh(
-			asOAuthCredential({
-				access: auth.access ?? "",
-				refresh: auth.refresh,
-				expires: auth.expires ?? 0,
-				projectId,
-			}),
-			new AbortController().signal,
-		) as GeminiCredentials;
+		const oauthCredentials = asOAuthCredential({
+			access: auth.access ?? "",
+			refresh: auth.refresh,
+			expires: auth.expires ?? 0,
+			projectId,
+		});
+		const adapter = getExternalProviderAdapter(account.baseProvider);
+		const credentials = adapter
+			? await adapter.buildOAuth(1).refreshToken(oauthCredentials, new AbortController().signal) as GeminiCredentials
+			: await getBuiltinOAuthFlow(account.baseProvider).refresh(
+				oauthCredentials,
+				new AbortController().signal,
+			) as GeminiCredentials;
 		return {
 			accessToken: credentials.access,
 			projectId: typeof credentials.projectId === "string" && credentials.projectId.length > 0
@@ -2023,6 +2045,10 @@ function getBaseProvider(providerName: string): string | undefined {
 // ==========================================================================
 
 function cloneModels(originalProvider: string, index: number) {
+	const external = getExternalProviderAdapter(originalProvider);
+	if (external) {
+		return external.getModels(`${originalProvider}-${index}`, index);
+	}
 	const models = getModels(originalProvider as any) as Model<Api>[];
 	return models.map((m) => ({
 		id: m.id,
@@ -2074,6 +2100,8 @@ function storedOverlayModels(baseProvider: string): Model<Api>[] {
  * pi-multi-pass release.
  */
 function liveSubscriptionModels(entry: SubEntry, name: string): Model<Api>[] {
+	const external = getExternalProviderAdapter(entry.provider);
+	if (external) return external.getModels(name, entry.index);
 	const builtin = getModels(entry.provider as any) as Model<Api>[];
 	const overlay = storedOverlayModels(entry.provider);
 	const merged = [...builtin];
@@ -2093,27 +2121,49 @@ function liveSubscriptionModels(entry: SubEntry, name: string): Model<Api>[] {
 // Register a single subscription as a provider
 // ==========================================================================
 
-function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
+const registeredSubscriptionProviders = new Set<string>();
+
+function registerSub(
+	pi: ExtensionAPI,
+	entry: SubEntry,
+	options?: { allowAntigravityBuiltinFallback?: boolean },
+): boolean {
 	const template = PROVIDER_TEMPLATES[entry.provider];
-	if (!template) return;
+	if (!template) return false;
 
 	const name = subProviderName(entry);
+	if (registeredSubscriptionProviders.has(name)) return true;
+
+	// Give pi-oauth-antigravity the whole extension-loading phase to publish its
+	// bridge. On session_start we fall back to Pi's builtin provider if absent.
+	if (
+		entry.provider === "google-antigravity"
+		&& !options?.allowAntigravityBuiltinFallback
+		&& !getExternalProviderAdapter("google-antigravity")
+	) {
+		return false;
+	}
+
 	const oauth = template.buildOAuth?.(entry.index);
 	const modifyModels = oauth ? template.buildModifyModels?.(name) : undefined;
+	const external = getExternalProviderAdapter(entry.provider);
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
-	const baseUrl = builtinModels[0]?.baseUrl || "";
 	const models = cloneModels(entry.provider, entry.index);
+	const baseUrl = external?.baseUrl || models[0]?.baseUrl || builtinModels[0]?.baseUrl || "";
+	const api = external?.api || models[0]?.api || builtinModels[0]?.api;
 
 	// Static `models` is only the startup baseline; refreshModels swaps in the
 	// live merged catalog (builtin + remote overlay) on every refresh cycle.
 	pi.registerProvider(name, {
 		baseUrl,
-		api: builtinModels[0]?.api,
+		api,
 		apiKey: template.apiKey,
 		oauth: oauth && modifyModels ? { ...oauth, modifyModels } : oauth,
 		models,
 		refreshModels: async () => liveSubscriptionModels(entry, name),
 	});
+	registeredSubscriptionProviders.add(name);
+	return true;
 }
 
 // ==========================================================================
@@ -3431,7 +3481,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	config.subscriptions.push(entry);
 	saveGlobalConfig(config);
 
-	registerSub(pi, entry);
+	registerSub(pi, entry, { allowAntigravityBuiltinFallback: true });
 	ctx.modelRegistry.refresh();
 
 	const loginNow = await ctx.ui.confirm(
@@ -5866,6 +5916,14 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// On session start, reload pools with project-level config
 	pi.on("session_start", async (_event, ctx) => {
+		let registeredDeferredProvider = false;
+		for (const entry of all) {
+			if (registerSub(pi, entry, { allowAntigravityBuiltinFallback: true })) {
+				registeredDeferredProvider = registeredDeferredProvider || entry.provider === "google-antigravity";
+			}
+		}
+		if (registeredDeferredProvider) ctx.modelRegistry.refresh();
+
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 
