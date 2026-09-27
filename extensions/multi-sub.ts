@@ -32,6 +32,14 @@
  *   - google-antigravity (Antigravity)
  *   - minimax             (MiniMax global API key)
  *   - minimax-cn          (MiniMax China API key)
+ *
+ * Any OAuth provider registered at runtime by a Pi extension (e.g. an
+ * `antigravity` provider added by pi-oauth-antigravity) is also supported:
+ * /subs add lists it, and its subscriptions reuse the extension's registered
+ * OAuth flow, transport and model catalogue. Extension-backed subscriptions
+ * register on session_start — during the load phase the registry does not
+ * see other extensions' providers yet — so they are selectable mid-session
+ * (/model, /subs switch) but not as a startup --model.
  */
 
 import {
@@ -50,6 +58,7 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	AgentEndEvent,
+	ProviderConfig,
 } from "@earendil-works/pi-coding-agent";
 import {
 	BorderedLoader,
@@ -129,14 +138,39 @@ interface AuthEventLike {
 
 const builtinOAuthFlows = new Map<string, BuiltinOAuthFlow>();
 
-function getBuiltinOAuthFlow(providerId: string): BuiltinOAuthFlow {
+/**
+ * Resolve a provider's OAuth flow generically:
+ *   1. the runtime model registry — this is where providers registered by
+ *      Pi extensions live (pi's composer exposes their oauth as a flow),
+ *   2. the built-in pi-ai provider catalog,
+ *   3. an error otherwise.
+ *
+ * `ctx` comes from the event or command that triggered the OAuth operation.
+ * Without one (extension load time) only built-in flows can resolve, because
+ * the registry does not see other extensions' providers until the whole load
+ * phase has completed.
+ */
+function resolveOAuthFlow(
+	providerId: string,
+	ctx?: ExtensionContext | ExtensionCommandContext,
+): BuiltinOAuthFlow {
+	const fromRegistry = ctx?.modelRegistry.getProvider(providerId)?.auth?.oauth as
+		| BuiltinOAuthFlow
+		| undefined;
+	if (
+		fromRegistry
+		&& typeof fromRegistry.login === "function"
+		&& typeof fromRegistry.refresh === "function"
+	) {
+		return fromRegistry;
+	}
 	const cached = builtinOAuthFlows.get(providerId);
 	if (cached) return cached;
 	const flow = builtinProviders().find((p) => p.id === providerId)?.auth?.oauth as
 		| BuiltinOAuthFlow
 		| undefined;
 	if (!flow || typeof flow.login !== "function" || typeof flow.refresh !== "function") {
-		throw new Error(`No built-in OAuth flow available for provider "${providerId}"`);
+		throw new Error(`No OAuth flow available for provider "${providerId}"`);
 	}
 	builtinOAuthFlows.set(providerId, flow);
 	return flow;
@@ -184,31 +218,34 @@ function asOAuthCredential(credentials: OAuthCredentials): OAuthCredentials & { 
 		: { ...credentials, type: "oauth" };
 }
 
-/** Build a legacy OAuth provider config backed by a built-in provider flow. */
+/** Build a legacy OAuth provider config backed by a resolved provider flow. */
 function flowBackedOAuth(
 	providerId: string,
 	name: string,
-	options?: { usesCallbackServer?: boolean },
+	options?: {
+		usesCallbackServer?: boolean;
+		ctx?: ExtensionContext | ExtensionCommandContext;
+	},
 ): Omit<OAuthProviderInterface, "id"> {
-	// Mirror the built-in flow's subscription flag so extra accounts light up
+	// Mirror the resolved flow's subscription flag so extra accounts light up
 	// pi's subscription handling (e.g. the footer indicator via
-	// modelRuntime.isUsingSubscription). Guarded: providers without a flow in
-	// the installed pi-ai version must not break registration.
+	// modelRuntime.isUsingSubscription). Guarded: providers without a
+	// resolvable flow must not break registration.
 	let isSubscription: boolean | undefined;
 	try {
-		isSubscription = getBuiltinOAuthFlow(providerId).isSubscription;
+		isSubscription = resolveOAuthFlow(providerId, options?.ctx).isSubscription;
 	} catch {
-		// no built-in flow available; leave the flag unset
+		// no flow available; leave the flag unset
 	}
 	return {
 		name,
 		isSubscription,
 		usesCallbackServer: options?.usesCallbackServer,
 		async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-			return getBuiltinOAuthFlow(providerId).login(toAuthInteraction(callbacks));
+			return resolveOAuthFlow(providerId, options?.ctx).login(toAuthInteraction(callbacks));
 		},
 		async refreshToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials> {
-			return getBuiltinOAuthFlow(providerId).refresh(
+			return resolveOAuthFlow(providerId, options?.ctx).refresh(
 				asOAuthCredential(credentials),
 				signal ?? new AbortController().signal,
 			);
@@ -254,32 +291,36 @@ interface ProviderTemplate {
 	displayName: string;
 	apiKey?: string;
 	usesCallbackServer?: boolean;
-	buildOAuth?(index: number): Omit<OAuthProviderInterface, "id">;
+	buildOAuth?(
+		index: number,
+		ctx?: ExtensionContext | ExtensionCommandContext,
+	): Omit<OAuthProviderInterface, "id">;
 	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
 }
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	anthropic: {
 		displayName: "Anthropic (Claude Pro/Max)",
-		buildOAuth(index: number) {
-			return flowBackedOAuth("anthropic", `Anthropic #${index}`);
+		buildOAuth(index: number, ctx?: ExtensionContext | ExtensionCommandContext) {
+			return flowBackedOAuth("anthropic", `Anthropic #${index}`, { ctx });
 		},
 	},
 
 	"openai-codex": {
 		displayName: "ChatGPT Plus/Pro (Codex)",
 		usesCallbackServer: true,
-		buildOAuth(index: number) {
+		buildOAuth(index: number, ctx?: ExtensionContext | ExtensionCommandContext) {
 			return flowBackedOAuth("openai-codex", `ChatGPT Codex #${index}`, {
 				usesCallbackServer: true,
+				ctx,
 			});
 		},
 	},
 
 	"github-copilot": {
 		displayName: "GitHub Copilot",
-		buildOAuth(index: number) {
-			return flowBackedOAuth("github-copilot", `GitHub Copilot #${index}`);
+		buildOAuth(index: number, ctx?: ExtensionContext | ExtensionCommandContext) {
+			return flowBackedOAuth("github-copilot", `GitHub Copilot #${index}`, { ctx });
 		},
 		buildModifyModels(providerName: string) {
 			return (models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] => {
@@ -295,9 +336,10 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	"google-gemini-cli": {
 		displayName: "Google Cloud Code Assist",
 		usesCallbackServer: true,
-		buildOAuth(index: number) {
+		buildOAuth(index: number, ctx?: ExtensionContext | ExtensionCommandContext) {
 			return flowBackedOAuth("google-gemini-cli", `Google Cloud Code Assist #${index}`, {
 				usesCallbackServer: true,
+				ctx,
 			});
 		},
 	},
@@ -305,9 +347,10 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	"google-antigravity": {
 		displayName: "Antigravity",
 		usesCallbackServer: true,
-		buildOAuth(index: number) {
+		buildOAuth(index: number, ctx?: ExtensionContext | ExtensionCommandContext) {
 			return flowBackedOAuth("google-antigravity", `Antigravity #${index}`, {
 				usesCallbackServer: true,
+				ctx,
 			});
 		},
 	},
@@ -324,6 +367,88 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 };
 
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
+
+// ==========================================================================
+// Extension-registered providers
+// ==========================================================================
+
+/**
+ * View of a provider registered at runtime by a Pi extension (or any other
+ * registry-visible provider that is not a built-in template). pi exposes it
+ * twice: `getRegisteredProviderConfig()` keeps the exact config the
+ * extension passed to `pi.registerProvider()` — legacy oauth callbacks,
+ * streamSimple transport, models — and `getProvider()` returns the composed
+ * provider whose `auth.oauth` is the pi-ai flow shape.
+ */
+interface ExtensionProviderView {
+	id: string;
+	displayName: string;
+	baseUrl?: string;
+	api?: Api;
+	models: Model<Api>[];
+	isSubscription?: boolean;
+	oauth: NonNullable<ProviderConfig["oauth"]>;
+	streamSimple?: ProviderConfig["streamSimple"];
+	refreshModels?: ProviderConfig["refreshModels"];
+	headers?: Record<string, string>;
+	authHeader?: boolean;
+}
+
+/** Display names of extension providers seen so far, for sub naming. */
+const extensionProviderNames = new Map<string, string>();
+
+function isSubscriptionProviderName(config: MultiPassConfig, providerName: string): boolean {
+	return config.subscriptions.some((entry) => subProviderName(entry) === providerName);
+}
+
+function resolveExtensionProvider(
+	ctx: ExtensionContext | ExtensionCommandContext,
+	providerId: string,
+): ExtensionProviderView | undefined {
+	const registry = ctx.modelRegistry as {
+		getRegisteredProviderConfig?(id: string): ProviderConfig | undefined;
+	} & ExtensionContext["modelRegistry"];
+	const config = registry.getRegisteredProviderConfig?.(providerId);
+	if (!config?.oauth) return undefined;
+	// Built-in providers are covered by PROVIDER_TEMPLATES; their flow comes
+	// from the catalog fallback in resolveOAuthFlow().
+	if (builtinProviders().some((p) => p.id === providerId)) return undefined;
+	const composed = registry.getProvider(providerId);
+	const displayName = composed?.name || config.name || config.oauth.name || providerId;
+	extensionProviderNames.set(providerId, displayName);
+	return {
+		id: providerId,
+		displayName,
+		baseUrl: config.baseUrl,
+		api: config.api,
+		models: (config.models ?? []) as Model<Api>[],
+		isSubscription: composed?.auth?.oauth?.isSubscription ?? config.oauth.isSubscription,
+		oauth: config.oauth,
+		streamSimple: config.streamSimple,
+		refreshModels: config.refreshModels,
+		headers: config.headers,
+		authHeader: config.authHeader,
+	};
+}
+
+/** Extension-registered OAuth providers that /subs add can offer. */
+function listExtensionOAuthProviders(
+	ctx: ExtensionContext | ExtensionCommandContext,
+	config: MultiPassConfig,
+): ExtensionProviderView[] {
+	const registry = ctx.modelRegistry as {
+		getRegisteredProviderIds?(): readonly string[];
+	};
+	const ids = registry.getRegisteredProviderIds?.() ?? [];
+	const views: ExtensionProviderView[] = [];
+	for (const id of ids) {
+		if (PROVIDER_TEMPLATES[id]) continue;
+		if (isSubscriptionProviderName(config, id)) continue;
+		const view = resolveExtensionProvider(ctx, id);
+		if (view) views.push(view);
+	}
+	return views;
+}
 
 // ==========================================================================
 // Built-in quota checking
@@ -395,6 +520,10 @@ interface QuotaAccount {
 	baseProvider: string;
 	displayName: string;
 	auth?: AuthStorageEntry;
+	/** Runtime ctx for OAuth resolution; set on the /subs limits path. */
+	ctx?: ExtensionContext | ExtensionCommandContext;
+	/** No built-in quota endpoint for this base provider: report login status only. */
+	loginStatusOnly?: boolean;
 }
 
 interface QuotaCheckResult {
@@ -855,7 +984,7 @@ async function runQuotaChecks(
 	const results = await Promise.all(accounts.map(async (account) => {
 		const checker = PROVIDER_QUOTA_CHECKERS.find(
 			(candidate) => candidate.baseProvider === account.baseProvider,
-		);
+		) ?? (account.loginStatusOnly ? loginStatusQuotaChecker : undefined);
 		if (!checker) return undefined;
 		return checker.check(account, signal);
 	}));
@@ -1078,9 +1207,9 @@ async function resolveGoogleQuotaAccess(
 	}
 
 	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
-		// pi-ai >= 0.84: use the built-in provider OAuth flow to refresh the
-		// access token instead of the removed refreshGoogleCloudToken helpers.
-		const flow = getBuiltinOAuthFlow(account.baseProvider);
+		// Refresh through the resolved provider flow (runtime registry first,
+		// built-in catalog fallback) instead of removed pi-ai refresh helpers.
+		const flow = resolveOAuthFlow(account.baseProvider, account.ctx);
 		const credentials = await flow.refresh(
 			asOAuthCredential({
 				access: auth.access ?? "",
@@ -1326,15 +1455,21 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 	const allowed = allowedProviderNames ? new Set(allowedProviderNames) : undefined;
 	const seen = new Set<string>();
 	const accounts: QuotaAccount[] = [];
-	const pushAccount = (providerName: string, displayName: string) => {
+	const pushAccount = (
+		providerName: string,
+		displayName: string,
+		options?: { loginStatusOnly?: boolean },
+	) => {
 		if (allowed && !allowed.has(providerName)) return;
 		if (seen.has(providerName)) return;
 		seen.add(providerName);
 		accounts.push({
 			providerName,
-			baseProvider: getBaseProvider(providerName) || providerName,
+			baseProvider: getBaseProvider(providerName, ctx) || providerName,
 			displayName,
 			auth: getAuthStorage(ctx).get(providerName) as AuthStorageEntry | undefined,
+			ctx,
+			loginStatusOnly: options?.loginStatusOnly,
 		});
 	};
 
@@ -1351,8 +1486,51 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 		}
 	}
 
+	// Subscriptions whose base provider was registered by an extension have
+	// no built-in quota endpoint; surface them with a login-status-only
+	// result so /subs limits stays truthful (their provider owns any real
+	// usage reporting, e.g. a slash command of its own).
+	for (const entry of allSubs) {
+		if (PROVIDER_QUOTA_CHECKERS.some((checker) => checker.baseProvider === entry.provider)) {
+			continue;
+		}
+		pushAccount(subProviderName(entry), subDisplayName(entry), { loginStatusOnly: true });
+	}
+
 	return accounts;
 }
+
+/**
+ * Fallback checker for subscription accounts whose base provider has no
+ * built-in quota endpoint (extension-registered providers): report the
+ * stored credential status without network access.
+ */
+const loginStatusQuotaChecker: ProviderQuotaChecker = {
+	baseProvider: "*",
+	async check(account: QuotaAccount): Promise<QuotaCheckResult> {
+		const auth = account.auth;
+		const loggedIn = !!auth && auth.type === "oauth"
+			&& typeof auth.access === "string" && auth.access.length > 0;
+		const expiry = auth && typeof auth.expires === "number" && auth.expires > 0
+			? new Date(auth.expires).toISOString()
+			: undefined;
+		return {
+			account,
+			kind: loggedIn ? "ready" : "missing-auth",
+			summary: loggedIn ? "logged in (no built-in quota endpoint)" : "not logged in",
+			details: [
+				`account: ${account.displayName}`,
+				`provider: ${account.providerName}`,
+				`status: ${loggedIn ? "logged in" : "not logged in"}`,
+				...(expiry ? [`credentials expire: ${expiry}`] : []),
+				...(loggedIn
+					? ["quota: ask the provider's own usage reporting (e.g. its slash command)"]
+					: ["login: use /subs login or /login to authenticate this account"]),
+			],
+			score: loggedIn ? 100 : 0,
+		};
+	},
+};
 
 const codexQuotaChecker: ProviderQuotaChecker = {
 	baseProvider: "openai-codex",
@@ -1907,11 +2085,11 @@ function findSelectableModelForProvider(
 			return preferred as Model<Api>;
 		}
 	}
-	const baseProvider = getBaseProvider(providerName);
+	const baseProvider = getBaseProvider(providerName, ctx);
 	if (!baseProvider) {
 		return undefined;
 	}
-	for (const baseModel of getModels(baseProvider as any) as Model<Api>[]) {
+	for (const baseModel of getBaseModels(ctx, baseProvider)) {
 		const candidate = ctx.modelRegistry.find(providerName, baseModel.id);
 		if (candidate) {
 			return candidate as Model<Api>;
@@ -1998,32 +2176,61 @@ function subProviderName(entry: SubEntry): string {
 
 function subDisplayName(entry: SubEntry): string {
 	const template = PROVIDER_TEMPLATES[entry.provider];
-	const providerName = `${template?.displayName || entry.provider} #${entry.index}`;
+	const base = template?.displayName || extensionProviderNames.get(entry.provider) || entry.provider;
+	const providerName = `${base} #${entry.index}`;
 	if (!entry.label) return providerName;
 	return `${entry.label} — ${providerName}`;
 }
 
 function subscriptionLoginName(entry: SubEntry): string {
-	return PROVIDER_TEMPLATES[entry.provider]?.buildOAuth?.(entry.index).name
-		?? subProviderName(entry);
+	const template = PROVIDER_TEMPLATES[entry.provider];
+	if (template?.buildOAuth) return template.buildOAuth(entry.index).name;
+	const extensionName = extensionProviderNames.get(entry.provider);
+	return extensionName ? `${extensionName} #${entry.index}` : subProviderName(entry);
 }
 
-/** Get the base provider type from a provider name, e.g. "openai-codex-2" -> "openai-codex" */
-function getBaseProvider(providerName: string): string | undefined {
+/** Get the base provider type from a provider name, e.g. "openai-codex-2" -> "openai-codex".
+ *
+ * With a runtime ctx, providers registered by extensions count as bases too:
+ * the registry is the only place they exist (they have no built-in catalog
+ * entry). */
+function getBaseProvider(
+	providerName: string,
+	ctx?: ExtensionContext | ExtensionCommandContext,
+): string | undefined {
 	// Direct match
 	if (PROVIDER_TEMPLATES[providerName]) return providerName;
 	// Strip trailing -N
 	const match = providerName.match(/^(.+)-(\d+)$/);
-	if (match && PROVIDER_TEMPLATES[match[1]]) return match[1];
+	const stripped = match?.[1];
+	if (stripped && PROVIDER_TEMPLATES[stripped]) return stripped;
+	if (ctx && stripped && ctx.modelRegistry.getProvider(stripped)?.auth?.oauth) return stripped;
+	// Bare extension provider ids (e.g. pool configs) are their own base.
+	if (ctx && ctx.modelRegistry.getProvider(providerName)?.auth?.oauth) return providerName;
 	return undefined;
+}
+
+/**
+ * Base provider model list for cloning/selection: the built-in catalog when
+ * it knows the provider, otherwise the runtime registry — the only place
+ * extension-registered providers expose their models.
+ */
+function getBaseModels(
+	ctx: ExtensionContext | ExtensionCommandContext,
+	baseProvider: string,
+): Model<Api>[] {
+	const builtin = getModels(baseProvider as any) as Model<Api>[];
+	if (builtin.length > 0) return builtin;
+	return ctx.modelRegistry.getAll().filter(
+		(model) => model.provider === baseProvider,
+	) as Model<Api>[];
 }
 
 // ==========================================================================
 // Model cloning
 // ==========================================================================
 
-function cloneModels(originalProvider: string, index: number) {
-	const models = getModels(originalProvider as any) as Model<Api>[];
+function cloneModelList(models: Model<Api>[], index: number) {
 	return models.map((m) => ({
 		id: m.id,
 		name: `${m.name} (#${index})`,
@@ -2037,6 +2244,11 @@ function cloneModels(originalProvider: string, index: number) {
 		headers: m.headers ? { ...m.headers } : undefined,
 		compat: m.compat,
 	}));
+}
+
+function cloneModels(originalProvider: string, index: number) {
+	const models = getModels(originalProvider as any) as Model<Api>[];
+	return cloneModelList(models, index);
 }
 
 /**
@@ -2089,31 +2301,83 @@ function liveSubscriptionModels(entry: SubEntry, name: string): Model<Api>[] {
 	}));
 }
 
+/**
+ * Live model list for an extension-backed subscription: the provider the
+ * extension registered owns its catalog, so the subscription mirrors it
+ * (delegating to the base provider's own refreshModels when it has one) and
+ * re-clones with the (#index) suffix.
+ */
+async function liveExtensionSubscriptionModels(
+	provider: ExtensionProviderView,
+	entry: SubEntry,
+	name: string,
+	context: Parameters<NonNullable<ProviderConfig["refreshModels"]>>[0],
+): Promise<NonNullable<ProviderConfig["models"]>> {
+	const base = provider.refreshModels
+		? await provider.refreshModels(context).catch(() => provider.models)
+		: provider.models;
+	return cloneModelList(base as Model<Api>[], entry.index).map((m) => ({
+		...m,
+		provider: name,
+	}));
+}
+
 // ==========================================================================
 // Register a single subscription as a provider
 // ==========================================================================
 
-function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
-	const template = PROVIDER_TEMPLATES[entry.provider];
-	if (!template) return;
-
+function registerSub(
+	pi: ExtensionAPI,
+	entry: SubEntry,
+	ctx?: ExtensionContext | ExtensionCommandContext,
+): boolean {
 	const name = subProviderName(entry);
-	const oauth = template.buildOAuth?.(entry.index);
-	const modifyModels = oauth ? template.buildModifyModels?.(name) : undefined;
-	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
-	const baseUrl = builtinModels[0]?.baseUrl || "";
-	const models = cloneModels(entry.provider, entry.index);
+	const template = PROVIDER_TEMPLATES[entry.provider];
 
-	// Static `models` is only the startup baseline; refreshModels swaps in the
-	// live merged catalog (builtin + remote overlay) on every refresh cycle.
+	if (template) {
+		const oauth = template.buildOAuth?.(entry.index, ctx);
+		const modifyModels = oauth ? template.buildModifyModels?.(name) : undefined;
+		const builtinModels = getModels(entry.provider as any) as Model<Api>[];
+		const baseUrl = builtinModels[0]?.baseUrl || "";
+		const models = cloneModels(entry.provider, entry.index);
+
+		// Static `models` is only the startup baseline; refreshModels swaps in the
+		// live merged catalog (builtin + remote overlay) on every refresh cycle.
+		pi.registerProvider(name, {
+			baseUrl,
+			api: builtinModels[0]?.api,
+			apiKey: template.apiKey,
+			oauth: oauth && modifyModels ? { ...oauth, modifyModels } : oauth,
+			models,
+			refreshModels: async () => liveSubscriptionModels(entry, name),
+		});
+		return true;
+	}
+
+	// Extension-registered base provider: the subscription reuses the provider
+	// the extension already registered — same OAuth flow and credentials
+	// handling, cloned model catalogue. streamSimple must be carried over
+	// because a custom Api has no native streamer in pi-ai; without it the
+	// subscription would load but fail on the first model request.
+	const provider = ctx ? resolveExtensionProvider(ctx, entry.provider) : undefined;
+	if (!provider) return false;
+
+	const oauth: Omit<OAuthProviderInterface, "id"> = {
+		...provider.oauth,
+		name: `${provider.displayName} #${entry.index}`,
+		isSubscription: provider.isSubscription ?? provider.oauth.isSubscription,
+	};
 	pi.registerProvider(name, {
-		baseUrl,
-		api: builtinModels[0]?.api,
-		apiKey: template.apiKey,
-		oauth: oauth && modifyModels ? { ...oauth, modifyModels } : oauth,
-		models,
-		refreshModels: async () => liveSubscriptionModels(entry, name),
+		baseUrl: provider.baseUrl,
+		api: provider.api ?? provider.models[0]?.api,
+		headers: provider.headers,
+		authHeader: provider.authHeader,
+		oauth,
+		models: cloneModelList(provider.models, entry.index),
+		streamSimple: provider.streamSimple,
+		refreshModels: async (context) => liveExtensionSubscriptionModels(provider, entry, name, context),
 	});
+	return true;
 }
 
 // ==========================================================================
@@ -3129,11 +3393,11 @@ function resolveSwitchTargetModel(
 			return preferred as Model<Api>;
 		}
 	}
-	const baseProvider = getBaseProvider(providerName);
+	const baseProvider = getBaseProvider(providerName, ctx);
 	if (!baseProvider) {
 		return undefined;
 	}
-	for (const baseModel of getModels(baseProvider as any) as Model<Api>[]) {
+	for (const baseModel of getBaseModels(ctx, baseProvider)) {
 		const candidate = ctx.modelRegistry.find(providerName, baseModel.id);
 		if (candidate) {
 			return candidate as Model<Api>;
@@ -3392,11 +3656,21 @@ async function handleSubsList(
 }
 
 async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-	const providerItems: SelectItem[] = SUPPORTED_PROVIDERS.map((provider) => ({
-		value: provider,
-		label: provider,
-		description: PROVIDER_TEMPLATES[provider]?.displayName,
-	}));
+	const config = loadGlobalConfig();
+	const extensionProviders = listExtensionOAuthProviders(ctx, config);
+
+	const providerItems: SelectItem[] = [
+		...SUPPORTED_PROVIDERS.map((provider) => ({
+			value: provider,
+			label: provider,
+			description: PROVIDER_TEMPLATES[provider]?.displayName,
+		})),
+		...extensionProviders.map((provider) => ({
+			value: provider.id,
+			label: provider.id,
+			description: `${provider.displayName} (registered by an extension)`,
+		})),
+	];
 
 	const provider = await showWrappedSelect(ctx, {
 		title: "Select provider to add",
@@ -3406,14 +3680,17 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	});
 	if (!provider) return;
 
-	if (!PROVIDER_TEMPLATES[provider]) {
+	const template = PROVIDER_TEMPLATES[provider];
+	const extensionProvider = template
+		? undefined
+		: extensionProviders.find((candidate) => candidate.id === provider);
+	if (!template && !extensionProvider) {
 		ctx.ui.notify(`Unknown provider: ${provider}`, "error");
 		return;
 	}
 
 	const label = await ctx.ui.input("Label (optional)", "e.g. work, personal");
 
-	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const allEntries = normalizeEntries(mergeConfigs(config, envEntries));
 	const usedIndices = new Set(
@@ -3431,7 +3708,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	config.subscriptions.push(entry);
 	saveGlobalConfig(config);
 
-	registerSub(pi, entry);
+	registerSub(pi, entry, ctx);
 	ctx.modelRegistry.refresh();
 
 	const loginNow = await ctx.ui.confirm(
@@ -3616,7 +3893,7 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 			status = "logged in (api key)";
 		}
 
-		const modelCount = (getModels(entry.provider as any) as Model<Api>[]).length;
+		const modelCount = getBaseModels(ctx, entry.provider).length;
 		const source = config.subscriptions.find(
 			(s) => s.provider === entry.provider && s.index === entry.index,
 		)
@@ -5592,10 +5869,10 @@ async function handlePresetCreate(
 		}
 
 		const provider = picked.split(" -- ")[0].trim();
-		const base = getBaseProvider(provider);
+		const base = getBaseProvider(provider, ctx);
 		if (!base) continue;
 
-		const models = (getModels(base as any) as Model<Api>[]).map((m) => m.id);
+		const models = getBaseModels(ctx, base).map((m) => m.id);
 		if (models.length === 0) {
 			ctx.ui.notify(`No models available for ${provider}.`, "warning");
 			continue;
@@ -5813,7 +6090,12 @@ export default function multiSub(pi: ExtensionAPI) {
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
-	// Register all subscriptions (always global)
+	// Register all subscriptions (always global). Extension-backed subs
+	// register on session_start instead: at load time the registry does not
+	// see other extensions' providers yet (registerProvider calls made during
+	// the load phase are queued and applied after all extensions loaded), so
+	// their oauth flow, transport and models can only be resolved once a
+	// runtime ctx is available.
 	for (const entry of all) {
 		registerSub(pi, entry);
 	}
@@ -5866,6 +6148,19 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// On session start, reload pools with project-level config
 	pi.on("session_start", async (_event, ctx) => {
+		// Re-register every subscription with the live registry: template subs
+		// gain registry-aware OAuth resolution, and extension-backed subs can
+		// only be registered here (extension providers are applied after the
+		// load phase, so the first ctx already sees them). registerProvider
+		// takes effect immediately after the load phase; re-registering
+		// replaces the config with one whose oauth closures resolve through
+		// this session's registry instead of the built-in catalog alone.
+		const globalConfig = loadGlobalConfig();
+		const envEntries = parseEnvConfig();
+		for (const entry of normalizeEntries(mergeConfigs(globalConfig, envEntries))) {
+			registerSub(pi, entry, ctx);
+		}
+
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 

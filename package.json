@@ -13,6 +13,10 @@
   ],
   "license": "MIT",
   "author": "hjanuschka",
+  "type": "module",
+  "scripts": {
+    "test": "for check in tests/*.mjs; do echo \"== $check\"; node \"$check\" || exit 1; done"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/hjanuschka/pi-multi-pass"
@@ -25,5 +29,10 @@
     "extensions": [
       "./extensions"
     ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-tui": "0.85.1"
   }
 }
