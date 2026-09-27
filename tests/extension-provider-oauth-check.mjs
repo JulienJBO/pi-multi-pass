@@ -321,5 +321,25 @@ assert.match(
 	"resolver must keep the built-in catalog fallback",
 );
 assert.doesNotMatch(source, /No built-in OAuth flow available/);
+assert.match(
+	source,
+	/function isProviderTemplateAvailable\(/,
+	"runtime-incompatible historical templates must be detectable",
+);
+assert.match(
+	source,
+	/function listAvailableBaseProviderIds\(/,
+	"menus must enumerate usable builtin and extension-registered base providers generically",
+);
+assert.match(
+	source,
+	/listAvailableBaseProviderIds\(ctx, config\)/,
+	"/subs add and pool/preset flows must use runtime-aware base-provider enumeration",
+);
+assert.match(
+	source,
+	/listAvailableBaseProviderIds\(ctx, globalConf\)/,
+	"project restrictions must include extension-registered base providers",
+);
 
 console.log("extension-provider-oauth checks passed");
