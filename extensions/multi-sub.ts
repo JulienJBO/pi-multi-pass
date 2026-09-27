@@ -450,6 +450,47 @@ function listExtensionOAuthProviders(
 	return views;
 }
 
+function isProviderTemplateAvailable(
+	ctx: ExtensionContext | ExtensionCommandContext,
+	providerId: string,
+): boolean {
+	const template = PROVIDER_TEMPLATES[providerId];
+	if (!template) return false;
+	// API-key templates do not need an OAuth flow.
+	if (!template.buildOAuth) return true;
+	try {
+		resolveOAuthFlow(providerId, ctx);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Base providers that are actually usable in this Pi runtime.
+ * Broken historical templates (for example google-antigravity after Pi removed
+ * its built-in OAuth flow) are hidden, while OAuth providers registered by
+ * extensions are included everywhere a base provider can be selected.
+ */
+function listAvailableBaseProviderIds(
+	ctx: ExtensionContext | ExtensionCommandContext,
+	config: MultiPassConfig,
+): string[] {
+	const ids = SUPPORTED_PROVIDERS.filter((providerId) =>
+		isProviderTemplateAvailable(ctx, providerId),
+	);
+	for (const provider of listExtensionOAuthProviders(ctx, config)) {
+		if (!ids.includes(provider.id)) ids.push(provider.id);
+	}
+	return ids;
+}
+
+function baseProviderDisplayName(providerId: string): string {
+	return PROVIDER_TEMPLATES[providerId]?.displayName
+		|| extensionProviderNames.get(providerId)
+		|| providerId;
+}
+
 // ==========================================================================
 // Built-in quota checking
 // ==========================================================================
@@ -2033,13 +2074,14 @@ function getProviderDisplayName(providerName: string, subscriptions: SubEntry[])
 	if (subEntry) {
 		return subDisplayName(subEntry);
 	}
-	return PROVIDER_TEMPLATES[providerName]?.displayName || providerName;
+	return PROVIDER_TEMPLATES[providerName]?.displayName || extensionProviderNames.get(providerName) || providerName;
 }
 
 function getProjectScopedProviderNames(
 	ctx: ExtensionContext | ExtensionCommandContext,
 	effective: EffectiveConfig,
 ): string[] {
+	const availableBaseProviders = listAvailableBaseProviderIds(ctx, loadGlobalConfig());
 	const seen = new Set<string>();
 	const providerNames: string[] = [];
 	const push = (providerName: string) => {
@@ -2053,14 +2095,14 @@ function getProjectScopedProviderNames(
 			const isExtraSubscription = effective.subscriptions.some(
 				(entry) => subProviderName(entry) === providerName,
 			);
-			const isSupportedBaseProvider = SUPPORTED_PROVIDERS.includes(providerName);
+			const isSupportedBaseProvider = availableBaseProviders.includes(providerName);
 			if (!isExtraSubscription && !isSupportedBaseProvider) continue;
 			push(providerName);
 		}
 		return providerNames;
 	}
 
-	for (const providerName of SUPPORTED_PROVIDERS) {
+	for (const providerName of availableBaseProviders) {
 		if (getAuthStorage(ctx).hasAuth(providerName)) {
 			push(providerName);
 		}
@@ -3366,10 +3408,10 @@ function getSwitchableProviderOptions(
 		options.push({ providerName, label, description });
 	};
 
-	for (const providerName of SUPPORTED_PROVIDERS) {
+	for (const providerName of listAvailableBaseProviderIds(ctx, config)) {
 		push(
 			providerName,
-			PROVIDER_TEMPLATES[providerName]?.displayName || providerName,
+			baseProviderDisplayName(providerName),
 			"base provider",
 		);
 	}
@@ -3657,20 +3699,15 @@ async function handleSubsList(
 
 async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadGlobalConfig();
-	const extensionProviders = listExtensionOAuthProviders(ctx, config);
+	const availableBaseProviders = listAvailableBaseProviderIds(ctx, config);
 
-	const providerItems: SelectItem[] = [
-		...SUPPORTED_PROVIDERS.map((provider) => ({
-			value: provider,
-			label: provider,
-			description: PROVIDER_TEMPLATES[provider]?.displayName,
-		})),
-		...extensionProviders.map((provider) => ({
-			value: provider.id,
-			label: provider.id,
-			description: `${provider.displayName} (registered by an extension)`,
-		})),
-	];
+	const providerItems: SelectItem[] = availableBaseProviders.map((provider) => ({
+		value: provider,
+		label: provider,
+		description: PROVIDER_TEMPLATES[provider]
+			? baseProviderDisplayName(provider)
+			: `${baseProviderDisplayName(provider)} (registered by an extension)`,
+	}));
 
 	const provider = await showWrappedSelect(ctx, {
 		title: "Select provider to add",
@@ -3683,7 +3720,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	const template = PROVIDER_TEMPLATES[provider];
 	const extensionProvider = template
 		? undefined
-		: extensionProviders.find((candidate) => candidate.id === provider);
+		: resolveExtensionProvider(ctx, provider);
 	if (!template && !extensionProvider) {
 		ctx.ui.notify(`Unknown provider: ${provider}`, "error");
 		return;
@@ -4222,10 +4259,9 @@ async function promptForPoolDefinition(
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
-	const providerLabels = SUPPORTED_PROVIDERS.map((p) => {
-		const t = PROVIDER_TEMPLATES[p];
-		return `${p} -- ${t.displayName}`;
-	});
+	const providerLabels = listAvailableBaseProviderIds(ctx, config).map(
+		(p) => `${p} -- ${baseProviderDisplayName(p)}`,
+	);
 
 	const selectedProvider = await ctx.ui.select("Pool base provider", providerLabels);
 	if (!selectedProvider) return undefined;
@@ -5468,7 +5504,7 @@ async function handlePoolProject(
 		const envEntries = parseEnvConfig();
 		const allSubs = normalizeEntries(mergeConfigs(globalConf, envEntries));
 		const allProviderNames = [
-			...SUPPORTED_PROVIDERS.filter((p) =>
+			...listAvailableBaseProviderIds(ctx, globalConf).filter((p) =>
 				getAuthStorage(ctx).hasAuth(p),
 			),
 			...allSubs.map((s) => subProviderName(s)),
@@ -5833,10 +5869,9 @@ async function handlePresetCreate(
 
 	const envEntries = parseEnvConfig();
 	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
-	const allProviders: string[] = [];
-	for (const provider of SUPPORTED_PROVIDERS) {
-		allProviders.push(provider);
-	}
+	const allProviders: string[] = [
+		...listAvailableBaseProviderIds(ctx, config),
+	];
 	for (const entry of allSubs) {
 		allProviders.push(subProviderName(entry));
 	}
@@ -5848,7 +5883,7 @@ async function handlePresetCreate(
 			`--- Entries (${entries.length}): ${entries.map((e) => formatPresetEntryWith(e, allSubs)).join(", ") || "none"} ---`,
 			...allProviders.map((p) => {
 				const template = PROVIDER_TEMPLATES[p];
-				const display = template?.displayName || p;
+				const display = template?.displayName || extensionProviderNames.get(p) || p;
 				const sub = allSubs.find((s) => subProviderName(s) === p);
 				const label = sub ? subDisplayName(sub) : display;
 				return `${p} -- ${label}`;
