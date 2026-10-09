@@ -105,7 +105,7 @@ function piWillRetryTurn(errorMessage) {
   const leading = errorMessage.match(/^\s*(?:Error:\s*)?(\d{3})\b/);
   const field = errorMessage.match(/"status"\s*:\s*(\d{3})\b/);
   const status = leading ? Number(leading[1]) : field ? Number(field[1]) : undefined;
-  if (status === undefined) return true;
+  if (status === undefined) return false;
   return status >= 500 || PI_RETRYABLE_STATUSES.has(status);
 }
 
@@ -710,6 +710,33 @@ async function runReplayDeliveryChecks() {
   const snapshot = harness.snapshot();
   assert.deepEqual(snapshot.sentPrompts, [prompt]);
   assert.deepEqual(snapshot.sentPromptOptions, [{ deliverAs: "followUp" }]);
+
+
+  // Antigravity may report an exhausted quota as plain text (no HTTP 429).
+  // The active account must rotate and the interrupted prompt must resume.
+  const antigravityConfig = {
+    pools: [{
+      name: "antigravity-pool",
+      baseProvider: "antigravity",
+      members: ["antigravity", "antigravity-2"],
+      enabled: true,
+    }],
+    chains: [],
+  };
+  const antigravityHarness = new RuntimeHarness(antigravityConfig, ["antigravity", "antigravity-2"]);
+  antigravityHarness.modelCatalog.set("antigravity", ["gemini-3.7-flash"]);
+  const antigravityPrompt = "continue coding";
+  antigravityHarness.startTurn(antigravityPrompt, { provider: "antigravity", id: "gemini-3.7-flash" });
+  const antigravityRotated = await antigravityHarness.handleError(
+    "Error: Quota reached. Please wait 2h31m7s. Next: switch models or try again after reset.",
+    { provider: "antigravity", id: "gemini-3.7-flash" },
+    antigravityPrompt,
+  );
+  assert.equal(antigravityRotated, true);
+  const antigravitySnapshot = antigravityHarness.snapshot();
+  assert.deepEqual(antigravitySnapshot.setModelCalls, ["antigravity-2:gemini-3.7-flash"]);
+  assert.deepEqual(antigravitySnapshot.sentPrompts, [antigravityPrompt]);
+  assert.deepEqual(antigravitySnapshot.sentPromptOptions, [{ deliverAs: "followUp" }]);
 
   console.log("replay-delivery checks passed");
 }
