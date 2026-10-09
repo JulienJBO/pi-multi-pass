@@ -2464,7 +2464,9 @@ function parseHttpStatus(errorMessage: string): number | undefined {
 
 function piWillRetryTurn(errorMessage: string): boolean {
 	const status = parseHttpStatus(errorMessage);
-	if (status === undefined) return true;
+	// A quota error without an HTTP status has already ended this agent turn.
+	// Do not assume Pi will retry it: explicitly replay after rotating accounts.
+	if (status === undefined) return false;
 	return status >= 500 || PI_RETRYABLE_STATUSES.has(status);
 }
 
